@@ -1,0 +1,507 @@
+---
+title: "Supervised Learning Workflow: Regression and Classification"
+subtitle: "Model selection and evaluation across a continuous and a categorical outcome"
+author: "Josh Lyons"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 6, fig.height = 4, fig.align = "center")
+
+set.seed(69)
+
+library(MASS)
+library(tidyverse)
+library(leaps)
+library(glmnet)
+library(tree)
+library(randomForest)
+library(class)
+library(gt)
+library(patchwork)
+library(here)
+
+# --- Regression: data ---
+weil <- read_csv(here("data", "Weil_2021.csv")) |>
+  select(-codeplot, -idplot, -type)
+
+weil_quantitative <- weil |> select(where(is.numeric))
+spnm_cors <- cor(weil_quantitative, use = "complete.obs")[, "spnm"]
+spnm_cors <- spnm_cors[names(spnm_cors) != "spnm"]
+
+# --- Regression: subset selection ---
+fstepwise_fit <- regsubsets(
+  spnm ~ .,
+  data = weil,
+  method = "forward",
+  nvmax = 38
+)
+fstepwise_summary <- summary(fstepwise_fit)
+
+criteria <- tibble(
+  size = seq_along(fstepwise_summary$bic),
+  BIC = fstepwise_summary$bic,
+  Cp = fstepwise_summary$cp,
+  `Adjusted R2` = fstepwise_summary$adjr2
+) |>
+  pivot_longer(-size, names_to = "metric", values_to = "value") |>
+  mutate(metric = factor(metric, levels = c("BIC", "Cp", "Adjusted R2")))
+
+optima <- criteria |>
+  group_by(metric) |>
+  filter(
+    (metric == "Adjusted R2" & value == max(value)) |
+    (metric != "Adjusted R2" & value == min(value))
+  ) |>
+  ungroup()
+n <- nrow(weil)
+X_full <- model.matrix(spnm ~ ., data = weil)
+selected_cols <- names(coef(fstepwise_fit, id = 7))
+loocv_preds_subset <- numeric(n)
+
+for (i in seq_len(n)) {
+  X_train <- X_full[-i, selected_cols]
+  y_train <- weil$spnm[-i]
+  beta <- lm.fit(X_train, y_train)$coefficients
+  loocv_preds_subset[i] <- X_full[i, selected_cols] %*% beta
+}
+loocv_mse_subset <- mean((weil$spnm - loocv_preds_subset)^2)
+
+# --- Regression: lasso ---
+x_mat <- model.matrix(spnm ~ ., data = weil)[, -1]
+y_vec <- weil$spnm
+
+lasso_cv <- cv.glmnet(x_mat, y_vec, alpha = 1)
+lambda_chosen <- lasso_cv$lambda.1se
+
+loocv_preds_lasso <- numeric(n)
+for (i in seq_len(n)) {
+  lasso_fit <- glmnet(x_mat[-i, ], y_vec[-i], alpha = 1, lambda = lambda_chosen)
+  loocv_preds_lasso[i] <- predict(lasso_fit, newx = x_mat[i, , drop = FALSE])
+}
+loocv_mse_lasso <- mean((y_vec - loocv_preds_lasso)^2)
+
+lasso_final <- glmnet(x_mat, y_vec, alpha = 1, lambda = lambda_chosen)
+lasso_coefs <- predict(lasso_final, type = "coefficients")[-1, ]
+
+# --- Regression: bootstrap ---
+B <- 1000
+cor_obs <- cor(weil$FRic_ses, weil$spnm)
+boot_cors <- numeric(B)
+for (b in seq_len(B)) {
+  idx <- sample(n, n, replace = TRUE)
+  boot_cors[b] <- cor(weil$FRic_ses[idx], weil$spnm[idx])
+}
+boot_se <- sd(boot_cors)
+ci_99 <- quantile(boot_cors, c(0.005, 0.995))
+
+# --- Classification: data ---
+zhou <- read_csv(here("data", "Zhou_2021_mortality.csv")) |>
+  select(-group, -ID) |>
+  mutate(across(everything(), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+train_0 <- sample(which(zhou$outcome == 0), round(0.6 * sum(zhou$outcome == 0)))
+train_1 <- sample(which(zhou$outcome == 1), round(0.6 * sum(zhou$outcome == 1)))
+train_idx <- c(train_0, train_1)
+
+zhou_train <- zhou[train_idx, ] |> mutate(outcome = factor(outcome))
+zhou_test  <- zhou[-train_idx, ] |> mutate(outcome = factor(outcome))
+
+zhou_train_clean <- zhou_train |> rename_with(make.names)
+zhou_test_clean  <- zhou_test  |> rename_with(make.names)
+
+# --- Decision Tree ---
+tree_fit <- tree(outcome ~ ., data = zhou_train_clean)
+cv_tree  <- cv.tree(tree_fit, FUN = prune.misclass)
+best_size <- cv_tree$size[cv_tree$size > 1][which.min(cv_tree$dev[cv_tree$size > 1])]
+tree_pruned <- prune.misclass(tree_fit, best = best_size)
+tree_pred   <- predict(tree_pruned, zhou_test_clean, type = "class")
+
+# --- Random Forest ---
+p <- ncol(zhou_train_clean) - 1
+mtry_vals <- 1:p
+n_iter <- 10
+oob_matrix <- matrix(NA, nrow = n_iter, ncol = p)
+for (iter in 1:n_iter) {
+  for (m in mtry_vals) {
+    rf_m <- randomForest(outcome ~ ., data = zhou_train_clean, mtry = m, ntree = 100)
+    oob_matrix[iter, m] <- rf_m$err.rate[100, "OOB"]
+  }
+}
+oob_errors <- colMeans(oob_matrix)
+best_mtry <- which.min(oob_errors)
+rf_fit  <- randomForest(outcome ~ ., data = zhou_train_clean,
+                        mtry = best_mtry, ntree = 500, importance = TRUE)
+rf_pred <- predict(rf_fit, zhou_test_clean)
+
+# --- LDA ---
+lda_fit <- lda(outcome ~ ., data = zhou_train_clean)
+thresholds <- seq(0.1, 0.9, by = 0.01)
+k_folds <- 10
+folds_lda <- sample(rep(1:k_folds, length.out = nrow(zhou_train_clean)))
+threshold_errors <- numeric(length(thresholds))
+for (j in seq_along(thresholds)) {
+  fold_errors <- numeric(k_folds)
+  for (fold in 1:k_folds) {
+    fit_fold  <- lda(outcome ~ ., data = zhou_train_clean[folds_lda != fold, ])
+    probs_fold <- predict(fit_fold, zhou_train_clean[folds_lda == fold, ])$posterior[, 2]
+    preds_fold <- ifelse(probs_fold > thresholds[j], 1, 0)
+    fold_errors[fold] <- mean(preds_fold != zhou_train_clean$outcome[folds_lda == fold])
+  }
+  threshold_errors[j] <- mean(fold_errors)
+}
+best_threshold <- thresholds[which.min(threshold_errors)]
+lda_pred <- factor(ifelse(
+  predict(lda_fit, zhou_test_clean)$posterior[, 2] > best_threshold, 1, 0
+))
+
+# --- KNN ---
+train_scaled <- scale(zhou_train_clean |> select(-outcome))
+test_scaled  <- scale(zhou_test_clean  |> select(-outcome),
+                      center = attr(train_scaled, "scaled:center"),
+                      scale  = attr(train_scaled, "scaled:scale"))
+k_vals   <- 1:50
+n_folds  <- 10
+folds_knn <- sample(rep(1:n_folds, length.out = nrow(zhou_train_clean)))
+knn_cv_errors <- numeric(length(k_vals))
+for (j in seq_along(k_vals)) {
+  fold_errors <- numeric(n_folds)
+  for (fold in 1:n_folds) {
+    knn_fold <- knn(
+      train = train_scaled[folds_knn != fold, ],
+      test  = train_scaled[folds_knn == fold, ],
+      cl    = zhou_train_clean$outcome[folds_knn != fold],
+      k     = k_vals[j]
+    )
+    fold_errors[fold] <- mean(knn_fold != zhou_train_clean$outcome[folds_knn == fold])
+  }
+  knn_cv_errors[j] <- mean(fold_errors)
+}
+best_k   <- k_vals[which.min(knn_cv_errors)]
+knn_pred <- knn(train = train_scaled, test = test_scaled,
+                cl = zhou_train_clean$outcome, k = best_k)
+
+# --- Tuning plots for patchwork ---
+tree_tune <- tibble(
+  size = cv_tree$size,
+  error = cv_tree$dev
+) |>
+  filter(size > 1) |>
+  ggplot(aes(x = size, y = error)) +
+  geom_line(colour = "grey40") +
+  geom_point(colour = "grey40") +
+  geom_point(
+    data = ~ filter(., error == min(error)),
+    colour = "firebrick", size = 3
+  ) +
+  labs(x = "Number of terminal nodes", y = "CV error") +
+  theme_classic(base_size = 11) +
+  scale_x_continuous(breaks = seq(0, max(cv_tree$size), by = 5))
+
+rf_tune <- tibble(
+  mtry = mtry_vals,
+  oob_error = oob_errors
+) |>
+  ggplot(aes(x = mtry, y = oob_error)) +
+  geom_line(colour = "grey40") +
+  geom_point(colour = "grey40") +
+  geom_point(
+    data = ~ filter(., oob_error == min(oob_error)),
+    colour = "firebrick", size = 3
+  ) +
+  labs(x = "mtry", y = "OOB error") +
+  theme_classic(base_size = 11)
+
+lda_tune <- tibble(
+  threshold = thresholds,
+  cv_error = threshold_errors
+) |>
+  ggplot(aes(x = threshold, y = cv_error)) +
+  geom_line(colour = "grey40") +
+  geom_point(colour = "grey40", size = 1) +
+  geom_vline(xintercept = best_threshold, colour = "firebrick",
+             linetype = "dashed") +
+  labs(x = "Posterior probability threshold", y = "CV error rate") +
+  theme_classic(base_size = 11)
+
+knn_tune <- tibble(
+  k = k_vals,
+  cv_error = knn_cv_errors
+) |>
+  ggplot(aes(x = k, y = cv_error)) +
+  geom_line(colour = "grey40") +
+  geom_point(colour = "grey40") +
+  geom_point(
+    data = ~ filter(., cv_error == min(cv_error)),
+    colour = "firebrick", size = 3
+  ) +
+  labs(x = "k", y = "CV error") +
+  theme_classic(base_size = 11) +
+  scale_x_continuous(breaks = seq(0, max(k_vals), by = 10))
+
+# --- Results table ---
+get_metrics <- function(pred, actual) {
+  pred   <- as.character(pred)
+  actual <- as.character(actual)
+  tp <- sum(pred == "1" & actual == "1")
+  tn <- sum(pred == "0" & actual == "0")
+  fp <- sum(pred == "1" & actual == "0")
+  fn <- sum(pred == "0" & actual == "1")
+  tibble(
+    Accuracy    = round((tp + tn) / (tp + tn + fp + fn), 3),
+    Sensitivity = round(tp / (tp + fn), 3),
+    Specificity = round(tn / (tn + fp), 3)
+  )
+}
+actual  <- zhou_test_clean$outcome
+results <- bind_rows(
+  get_metrics(tree_pred, actual),
+  get_metrics(rf_pred,   actual),
+  get_metrics(lda_pred,  actual),
+  get_metrics(knn_pred,  actual)
+) |>
+  mutate(Model = c("Decision Tree", "Random Forest", "LDA", "KNN")) |>
+  select(Model, everything())
+```
+
+<style>
+p.caption {
+  text-align: center;
+  font-size: 0.9em;
+  color: #555;
+  margin-top: 0.6em;
+  margin-bottom: 0.4em;
+}
+.figure {
+  margin: 2.4em 0;
+  text-align: center;
+}
+.figure img, img {
+  display: block;
+  margin-left: auto;
+  margin-right: auto;
+}
+.gt_table {
+  margin: 2.4em auto !important;
+}
+body { line-height: 1.7; }
+p { margin-bottom: 1.25em; }
+h1, h2 { margin-top: 2em; }
+h3 { margin-top: 1.5em; }
+</style>
+
+# Regression: Predicting species richness
+
+## Exploratory Data Analysis
+
+The Weil 2021 dataset contains ecological measurements from mountain grassland plots in the French Alps, including plant traits, soil properties and climate variables. The prediction task is to model species richness (`spnm`) using the remaining predictors, which include both continuous ecological measurements and a categorical gradient variable describing the site.
+
+```{r fig.cap = "**Figure 1:** Pearson correlation of each predictor with species richness (spnm), ordered by absolute correlation magnitude. Blue bars indicate positive correlations, coral bars indicate negative correlations."}
+tibble(
+  predictor = names(spnm_cors),
+  correlation = spnm_cors
+) |>
+  mutate(predictor = fct_reorder(predictor, abs(correlation))) |>
+  ggplot(aes(x = correlation, y = predictor, fill = correlation > 0)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "coral")) +
+  labs(x = "Correlation with spnm", y = NULL) +
+  theme_classic(base_size = 11) +
+  scale_x_continuous(breaks = seq(-0.5, 0.5, by = 0.1))
+```
+
+The correlation plot revealed that `FEve`, `FRic_ses` and `pH` had the strongest positive associations with species richness, while `x` was the only predictor with a meaningful negative correlation. Several predictors showed correlations close to zero, suggesting they are unlikely to be useful and could potentially be excluded, which was promising given the tight ratio of observations to predictors and motivated the use of methods designed to perform variable selection. The majority of predictors showed weak correlations, suggesting that no single variable dominates and that multiple predictors are likely to contribute to a useful model.
+
+```{r}
+weil |>
+  group_by(gradient) |>
+  summarise(
+    n = n(),
+    mean_spnm = mean(spnm),
+    sd_spnm = sd(spnm),
+    min_spnm = min(spnm),
+    max_spnm = max(spnm),
+    .groups = "drop"
+  ) |>
+  gt() |>
+   tab_header(
+    title = md("Table 1: Species richness distribution across gradients."),
+    subtitle = md("**Weil 2021** via Dryad")
+  ) |>
+  fmt_number(columns = c(mean_spnm, sd_spnm), decimals = 2) |>
+  cols_label(
+    gradient = "Gradient",
+    n = "Total obs.",
+    mean_spnm = "Mean",
+    sd_spnm = "SD",
+    min_spnm = "Min",
+    max_spnm = "Max"
+  )
+```
+
+Table 1 shows that mean species richness varied considerably across gradients, ranging from `r round(min(tapply(weil$spnm, weil$gradient, mean)), 1)` to `r round(max(tapply(weil$spnm, weil$gradient, mean)), 1)`, indicating that gradient was likely to be an informative predictor. Sample sizes per gradient were small, with most sites having only 2–5 observations and one gradient having a single observation.
+
+## Subset Selection and Shrinkage
+
+### Forward Stepwise Selection
+
+Forward stepwise selection was used, which starts from the null model and adds one predictor at a time. Best subset selection was infeasible with approximately 38 predictors, requiring 2^38 models to be fitted. Backward stepwise requires n > p and while technically satisfied here, with n = `r nrow(weil)` and approximately 38 predictors the margin was too small for the method to be reliable.
+
+```{r fig.cap = "**Figure 2:** BIC, Cp and adjusted R² against subset size for forward stepwise selection. Red points mark the optimum under each criterion."}
+criteria |>
+  ggplot(aes(x = size, y = value)) +
+  geom_line(colour = "grey40") +
+  geom_point(colour = "grey40", size = 1) +
+  geom_point(data = optima, colour = "firebrick", size = 3) +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(x = "Subset size", y = NULL) +
+  theme_classic(base_size = 11)
+```
+
+BIC was used to select the subset size, as its heavier penalty per predictor discourages overfitting in small samples. Cp suggested a slightly smaller model than BIC at `r which.min(fstepwise_summary$cp)` predictors, which was an unexpected inversion given BIC's heavier penalty to complexity, while adjusted R² favoured a much larger model, consistent with its tendency to over select. The BIC curve suggested that a model of 7 predictors was within 2 units of the global minimum at 10 predictors, which was not considered sufficient evidence to prefer the more complex model, so p = 7 was selected. The LOOCV RMSE for the subset selection model was `r round(sqrt(loocv_mse_subset), 2)` species.
+
+### Lasso Regression
+
+Lasso regression was used as the shrinkage method. Lasso applies an L1 penalty that simultaneously shrinks coefficients toward zero and can set some exactly to zero, performing both shrinkage and variable selection in a single step. Ridge regression applies an L2 penalty that shrinks all coefficients but never sets any to zero, retaining all predictors regardless of their relevance. This made lasso more appropriate for this dataset since the EDA showed that most predictors had weak correlations with species richness, suggesting that many would benefit from shrinkage, while several had correlations near zero, suggesting they should be excluded entirely.
+
+```{r fig.cap = "**Figure 3:** 10-fold CV MSE against log(lambda) for the lasso. Dashed lines indicate lambda.min and lambda.1se."}
+plot(lasso_cv)
+```
+
+The CV curve showed a relatively flat minimum across a range of lambda values. At the lambda that minimised CV error the model retained `r sum(predict(lasso_cv, type = "coefficients", s = lasso_cv$lambda.min) != 0) - 1` predictors, while the largest lambda within one standard error of the minimum retained `r sum(predict(lasso_cv, type = "coefficients", s = lasso_cv$lambda.1se) != 0) - 1` predictors. The difference in RMSE between the two was approximately 1 species, which was not considered sufficient to justify the more complex model, so the more parsimonious lambda was selected. The LOOCV RMSE for the lasso model was `r round(sqrt(loocv_mse_lasso), 2)` species.
+
+## Bootstrap Confidence Interval for a Key Predictor
+
+`FRic_ses` was selected as it showed one of the strongest positive correlations with species richness in the EDA, appeared in both models and had the largest coefficient in both by a considerable margin, suggesting it has the strongest association with species richness after accounting for other predictors.
+
+```{r}
+tibble(
+  Predictor      = "FRic_ses",
+  Correlation    = round(cor_obs, 4),
+  `Bootstrap SE` = round(boot_se, 4),
+  `99% CI Lower` = round(ci_99[1], 4),
+  `99% CI Upper` = round(ci_99[2], 4)
+) |>
+  gt() |>
+  tab_header(
+    title = md("Table 2: Bootstrap 99% CI for correlation between `FRic_ses` and species richness"),
+    subtitle = md("**Weil 2021** via Dryad")
+  )
+```
+
+The 99% confidence interval does not include zero, providing evidence of a genuine positive association between functional richness and species richness. The confidence interval is fairly wide, which is expected given the small sample size of `r nrow(weil)` observations and shows the uncertainty around the point estimate of correlation.
+
+## Model Comparison
+
+The subset selection model achieved a LOOCV RMSE of `r round(sqrt(loocv_mse_subset), 2)` species compared to `r round(sqrt(loocv_mse_lasso), 2)` species for lasso, a meaningful difference suggesting subset selection generalised considerably better on this dataset. Despite performing less accurately, the lasso retained a notably sparser model of just `x`, `FRic_ses`, `FEve` and `pH` compared to the seven predictors retained by subset selection: `x`, `RD`, `FRic_ses`, `FEve`, `pH`, `MAT` and `gradientPAI`. The signs of the shared coefficients agreed between both methods, with `x` negative and `FRic_ses`, `FEve` and `pH` positive. The consistent selection of `FRic_ses`, `FEve` and `pH` across two fundamentally different methods provides stronger evidence that these predictors have genuine associations with species richness than either method alone would suggest.
+
+# Classification: Predicting in-hospital mortality
+
+## Exploratory Data Analysis
+
+The Zhou 2021 dataset contains clinical measurements for `r nrow(zhou)` patients admitted to an ICU with heart failure, with the goal of predicting in-hospital mortality. The dataset is considerably imbalanced with `r table(zhou$outcome)[1]` survivors and `r table(zhou$outcome)[2]` deaths, which is important context for interpreting model performance.
+
+```{r}
+zhou |>
+  mutate(outcome = factor(outcome, labels = c("Survived", "Died"))) |>
+  select(outcome, hypertensive, atrialfibrillation, `CHD with no MI`,
+         diabetes, deficiencyanemias, depression, Hyperlipemia,
+         `Renal failure`, COPD) |>
+  pivot_longer(-outcome, names_to = "variable", values_to = "value") |>
+  group_by(variable, outcome) |>
+  summarise(n = sum(value), .groups = "drop") |>
+  pivot_wider(names_from = outcome, values_from = n) |>
+  mutate(
+    `% of Survivors` = round(Survived / sum(zhou$outcome == 0) * 100, 1),
+    `% of Deaths` = round(Died / sum(zhou$outcome == 1) * 100, 1)
+  ) |>
+  select(variable, `% of Survivors`, `% of Deaths`) |>
+  arrange(desc(`% of Deaths`)) |>
+  gt() |>
+  tab_header(
+    title = md("Table 3: Comorbidity prevalence by patient outcome"),
+    subtitle = md("**Zhou 2021** via Dryad")
+  ) |>
+  cols_label(variable = "Comorbidity")
+```
+
+The comorbidity table showed that most conditions were more prevalent in survivors than deaths, which likely reflects the class imbalance rather than a genuine protective effect. The notable exception was atrial fibrillation, which was more common in patients who died (`r round(sum(zhou$outcome == 1 & zhou[["atrialfibrillation"]] == 1) / sum(zhou$outcome == 1) * 100, 1)`%) than those who survived (`r round(sum(zhou$outcome == 0 & zhou[["atrialfibrillation"]] == 1) / sum(zhou$outcome == 0) * 100, 1)`%), suggesting a genuine association with mortality risk.
+
+```{r fig.cap = "**Figure 4:** Distribution of the four continuous predictors with the largest mean difference between survivors and deaths. Variables were selected by ranking all continuous predictors by percentage difference in means between outcome groups."}
+zhou |>
+  mutate(outcome = factor(outcome, labels = c("Survived", "Died"))) |>
+  select(outcome, `NT-proBNP`, `Urea nitrogen`, `Urine output`, Leucocyte) |>
+  pivot_longer(-outcome, names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = outcome, y = value, fill = outcome)) +
+  geom_boxplot(show.legend = FALSE) +
+  facet_wrap(~ variable, scales = "free_y") +
+  scale_fill_manual(values = c("Survived" = "steelblue", "Died" = "coral")) +
+  labs(x = NULL, y = NULL) +
+  theme_classic(base_size = 11) +
+  theme(strip.background = element_blank())
+```
+
+The boxplots showed that patients who died tended to have higher `NT-proBNP`, `Urea nitrogen` and `Leucocyte` values and lower `Urine output` than survivors, suggesting these variables may carry some useful predictive information. However, all four variables showed considerable overlap between groups and a number of extreme outliers, suggesting these differences alone are unlikely to be sufficient for reliable classification.
+
+## Hyperparameter Tuning
+
+### Decision Tree
+The number of terminal nodes was tuned using cross-validation with misclassification error as the criterion. The single node solution was excluded as it represents a degenerate model that simply predicts the majority class for all observations, which provides no useful discrimination between outcomes. The optimal size was `r best_size` terminal nodes, reflecting that a simple tree with few splits was sufficient to capture the main signal in the training data. The small optimal size may also reflect the class imbalance, where the tree quickly learns to predict survival for most observations.
+
+### Random Forest
+The `mtry` parameter was tuned by evaluating out-of-bag error across all possible values, averaged over 10 repeated runs to reduce instability. The optimal value was `r best_mtry`, which is higher than the rule of thumb of √p ≈ `r round(sqrt(p))` for classification, possibly reflecting that having more predictors available at each split helps the forest find the rare signal associated with deaths given the class imbalance.
+
+### Linear Discriminant Analysis
+The posterior probability threshold for classifying observations as deaths was tuned using 10-fold cross-validation, selecting the threshold that minimised overall CV error. A threshold of `r best_threshold` was selected, close to the default of 0.5, reflecting that the class imbalance caused the model to achieve its lowest overall error by predicting survival for most observations.
+
+### K-Nearest Neighbours
+Predictors were standardised prior to fitting since KNN is distance-based. The number of neighbours k was tuned using 10-fold cross-validation, with `r best_k` selected. KNN is known to struggle with class imbalance since the majority class tends to dominate the neighbourhood, which may limit its ability to identify deaths in this dataset.
+
+```{r fig.width = 8, fig.height = 6, fig.cap = "**Figure 5:** Hyperparameter tuning results for each of the four classification models. Red points or dashed lines indicate the selected hyperparameter."}
+(tree_tune | rf_tune) / (lda_tune | knn_tune)
+```
+
+## Results
+
+```{r}
+results |> 
+  gt() |>
+  tab_header(
+    title = md("Table 4: Classification model performance on the test set"),
+    subtitle = md("**Zhou 2021** via Dryad")
+  )
+```
+
+All four models achieved high overall accuracy, ranging from `r round(min(results$Accuracy)*100, 1)`% to `r round(max(results$Accuracy)*100, 1)`%, but as noted in the EDA this is largely a consequence of the class imbalance. A trivial model predicting survival for every patient would achieve `r round(table(zhou$outcome)[1] / nrow(zhou) * 100, 1)`% accuracy. Sensitivity for deaths is therefore the more informative metric. LDA performed best at identifying deaths with a sensitivity of `r results$Sensitivity[results$Model == "LDA"]`. This may reflect that a linear decision boundary was more appropriate for this dataset than the more flexible boundaries used by the tree-based methods and KNN, though the threshold tuning also contributed by pushing the model to classify more observations as deaths. KNN performed worst at `r results$Sensitivity[results$Model == "KNN"]`, consistent with the known tendency of KNN to be dominated by the majority class in imbalanced settings. When most neighbours are survivors, the model predicts survival regardless of the test observation. The random forest and decision tree both showed very low sensitivity, suggesting they largely predicted survival for most observations, consistent with the EDA finding that no single variable clearly separated the two groups.
+
+## Model Interpretation
+
+### Decision Tree Visualisation
+
+```{r fig.cap = "**Figure 6:** Pruned decision tree."}
+plot(tree_pruned)
+text(tree_pruned, pretty = 0)
+```
+
+The pruned tree used just two splits, first on `Anion gap` and then on `Bicarbonate`. Patients with a low anion gap were predicted to survive, while those with a high anion gap and low bicarbonate were predicted to die. The simplicity of the tree is consistent with the low sensitivity observed in the results table since a model with only two splits has limited ability to capture the complexity of mortality prediction, particularly for a minority class.
+
+### Random Forest Variable Importance
+
+```{r fig.height = 8, fig.cap = "**Figure 7:** Mean decrease in accuracy for each predictor in the random forest."}
+importance(rf_fit) |>
+  as.data.frame() |>
+  rownames_to_column("variable") |>
+  arrange(MeanDecreaseAccuracy) |>
+  mutate(variable = fct_inorder(variable)) |>
+  ggplot(aes(x = MeanDecreaseAccuracy, y = variable)) +
+  geom_col(fill = "steelblue") +
+  labs(x = "Mean decrease in accuracy", y = NULL) +
+  theme_classic(base_size = 11)
+```
+
+`Anion.gap` was by far the most important predictor, consistent with it being the first split in the decision tree. `Bicarbonate` also ranked highly, consistent with its role as the second split in the decision tree, suggesting both variables have genuine predictive value beyond the tree alone. `Urine.output`, `Blood.calcium` and `Urea.nitrogen` also showed meaningful importance, suggesting a cluster of biochemical markers are most predictive of mortality. Several variables at the bottom of the plot showed importance near or below zero, particularly the binary comorbidity indicators such as `hypertensive`, `depression` and `atrialfibrillation`, suggesting they contributed little predictive signal, consistent with the EDA observation that most comorbidities were not clearly associated with mortality outcome.
