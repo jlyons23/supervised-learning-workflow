@@ -71,11 +71,4 @@ All analysis code is in `report.Rmd`.
 
 ## Data
 
-Both datasets are public on Dryad.
-
-- Weil, S. S., et al. (2021). Strong links between plant traits and microbial activities
-  but different abiotic drivers in mountain grasslands. Journal of Biogeography, 48(11),
-  2755-2770. Data: https://doi.org/10.5061/dryad.cjsxksn63
-- Li, F., Xin, H., Zhang, J., Fu, M., Zhou, J., & Lian, Z. (2021). Prediction model of
-  in-hospital mortality in intensive care unit patients with heart failure. BMJ Open,
-  11(7), e044779. Data: https://doi.org/10.5061/dryad.0p2ngf1zd
+Two public Dryad datasets. See `data/README.md` for sources, citations and cleaning notes.
