@@ -1,0 +1,12 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# data (public datasets, downloaded locally, see data/README.md)
+data/*.csv
+
+# OS
+.DS_Store
+Thumbs.db
