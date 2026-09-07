@@ -43,9 +43,9 @@ survivors than deaths, and that is the crux of the interpretation.
 ```
 supervised-learning-workflow/
 ├── README.md
-├── report.Rmd        # full analysis: code, figures and interpretation
-├── index.html        # rendered report (knit report.Rmd, then rename to index.html)
-├── data/README.md    # dataset sources and download instructions
+├── report.Rmd        
+├── index.html        
+├── data/README.md
 └── .gitignore
 ```
 
